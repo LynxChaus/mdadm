@@ -1215,6 +1215,7 @@ static int start_array(int mdfd,
 		if (!enough(content->array.level, content->array.raid_disks,
 			    content->array.layout, 1, avail))
 			fprintf(stderr, " - not enough to start the array.\n");
+		/* XXX: FIXME: in patch here - ioctl(mdfd, STOP_ARRAY, NULL); */
 		else if (!enough(content->array.level,
 				 content->array.raid_disks,
 				 content->array.layout, clean,
@@ -1352,9 +1353,21 @@ try_again:
 	 */
 	if (!st && ident->st)
 		st = ident->st;
-	if (c->verbose>0)
-		pr_err("looking for devices for %s\n",
-		       mddev ? mddev : "further assembly");
+
+	if (c->verbose > 0) {
+		char uuid[64], *id;
+
+		if (mddev)
+			id = mddev;
+		else if (ident->uuid_set) {
+			__fname_from_uuid(ident->uuid,
+					  st ? st->ss->swapuuid : 0,
+					  uuid, ':');
+			id = uuid + 5;
+		} else
+			id = "further assembly";
+		pr_err("looking for devices for %s\n", id);
+	}
 
 	content = &info;
 	if (st && c->force)

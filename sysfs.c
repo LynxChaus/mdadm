@@ -633,8 +633,9 @@ int sysfs_set_array(struct mdinfo *info, int vers)
 			return 1;
 		}
 	}
-	if (info->array.level < 0)
-		return 0; /* FIXME */
+	/* containers have no personality, they're rather bland */
+	if (info->array.level <= LEVEL_CONTAINER)
+		return 0;
 	rv |= sysfs_set_str(info, NULL, "level",
 			    map_num(pers, info->array.level));
 	if (info->reshape_active && info->delta_disks != UnSet)
@@ -642,7 +643,13 @@ int sysfs_set_array(struct mdinfo *info, int vers)
 	rv |= sysfs_set_num(info, NULL, "raid_disks", raid_disks);
 	rv |= sysfs_set_num(info, NULL, "chunk_size", info->array.chunk_size);
 	rv |= sysfs_set_num(info, NULL, "layout", info->array.layout);
-	rv |= sysfs_set_num(info, NULL, "component_size", info->component_size/2);
+	if (info->array.level == LEVEL_ISRT) {
+		/* FIXME: how do we support asymmetric component sizes for
+		 * external metadata?
+		 */
+		rv |= sysfs_set_num(info, NULL, "component_size", 0);
+	} else
+		rv |= sysfs_set_num(info, NULL, "component_size", info->component_size/2);
 	if (info->custom_array_size) {
 		int rc;
 

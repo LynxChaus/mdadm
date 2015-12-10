@@ -22,6 +22,7 @@
 #include "mdmon.h"
 #include "sha1.h"
 #include "platform-intel.h"
+#include "isrt-intel.h"
 #include <values.h>
 #include <scsi/sg.h>
 #include <ctype.h>
@@ -39,7 +40,6 @@
 #define MPB_VERSION_CNG "1.2.06"
 #define MPB_VERSION_ATTRIBS "1.3.00"
 #define MAX_SIGNATURE_LENGTH  32
-#define MAX_RAID_SERIAL_LEN   16
 
 /* supports RAID0 */
 #define MPB_ATTRIB_RAID0		__cpu_to_le32(0x00000001)
@@ -81,7 +81,8 @@
 					MPB_ATTRIB_RAID1           | \
 					MPB_ATTRIB_RAID10          | \
 					MPB_ATTRIB_RAID5           | \
-					MPB_ATTRIB_EXP_STRIPE_SIZE)
+					MPB_ATTRIB_EXP_STRIPE_SIZE | \
+					MPB_ATTRIB_NVM)
 
 /* Define attributes that are unused but not harmful */
 #define MPB_ATTRIB_IGNORED		(MPB_ATTRIB_NEVER_USE)
@@ -179,6 +180,8 @@ struct imsm_dev {
 #define DEV_CLONE_N_GO		__cpu_to_le32(0x400)
 #define DEV_CLONE_MAN_SYNC	__cpu_to_le32(0x800)
 #define DEV_CNG_MASTER_DISK_NUM	__cpu_to_le32(0x1000)
+/* Volume is being used as NvCache for an accelerated volume */
+#define DEV_NVC_VOLUME          __cpu_to_le32(0x4000)
 	__u32 status;	/* Persistent RaidDev status */
 	__u32 reserved_blocks; /* Reserved blocks at beginning of volume */
 	__u8  migr_priority;
@@ -188,8 +191,19 @@ struct imsm_dev {
 	__u16 cache_policy;
 	__u8  cng_state;
 	__u8  cng_sub_state;
-#define IMSM_DEV_FILLERS 10
-	__u32 filler[IMSM_DEV_FILLERS];
+	__u16 dev_id;
+	__u8 nv_cache_mode;
+#define DEV_NVC_CLEAN		(0)
+#define DEV_NVC_DIRTY		(1)
+#define DEV_NVC_HEALTH_GOOD     (0 << 1)
+#define DEV_NVC_HEALTH_FAILED	(1 << 1)
+#define DEV_NVC_HEALTH_READONLY	(2 << 1)
+#define DEV_NVC_HEALTH_BACKUP	(3 << 1)
+	__u8 nv_cache_flags;
+	__u32 nvc_orig_family_num; /* Unique Volume Id of the cache */
+	__u16 nvc_dev_id;	   /* volume associated with this volume */
+	__u16 fill;
+	__u32 filler[7];
 	struct imsm_vol vol;
 } __attribute__ ((packed));
 
@@ -209,8 +223,9 @@ struct imsm_super {
 	__u32 orig_family_num;		/* 0x40 - 0x43 original family num */
 	__u32 pwr_cycle_count;		/* 0x44 - 0x47 simulated power cycle count for array */
 	__u32 bbm_log_size;		/* 0x48 - 0x4B - size of bad Block Mgmt Log in bytes */
-#define IMSM_FILLERS 35
-	__u32 filler[IMSM_FILLERS];	/* 0x4C - 0xD7 RAID_MPB_FILLERS */
+	__u16 create_events;		/* counter for generating unique ids */
+	__u16 fill1;
+	__u32 filler[34];
 	struct imsm_disk disk[1];	/* 0xD8 diskTbl[numDisks] */
 	/* here comes imsm_dev[num_raid_devs] */
 	/* here comes BBM logs */
@@ -331,6 +346,7 @@ static unsigned int mpb_sectors(struct imsm_super *mpb)
 struct intel_dev {
 	struct imsm_dev *dev;
 	struct intel_dev *next;
+	struct nv_cache_control_data *nvc;
 	unsigned index;
 };
 
@@ -364,6 +380,8 @@ struct intel_super {
 	int updates_pending; /* count of pending updates for mdmon */
 	int current_vol; /* index of raid device undergoing creation */
 	unsigned long long create_offset; /* common start for 'current_vol' */
+	int load_cache; /* flag to indicate we are operating on the cache metadata */
+	int cache_dev; /* subarray/volume index of the cache volume */
 	__u32 random; /* random data for seeding new family numbers */
 	struct intel_dev *devlist;
 	struct dl {
@@ -771,16 +789,38 @@ static struct imsm_dev *__get_imsm_dev(struct imsm_super *mpb, __u8 index)
 	return NULL;
 }
 
-static struct imsm_dev *get_imsm_dev(struct intel_super *super, __u8 index)
+static struct intel_dev *get_intel_dev(struct intel_super *super, __u8 index)
 {
 	struct intel_dev *dv;
 
-	if (index >= super->anchor->num_raid_devs)
-		return NULL;
 	for (dv = super->devlist; dv; dv = dv->next)
 		if (dv->index == index)
-			return dv->dev;
+			return dv;
 	return NULL;
+}
+
+static int is_isrt_leg(struct intel_dev *dv)
+{
+	return dv->nvc || nvc_enabled(dv->dev->nv_cache_mode);
+}
+
+static struct intel_dev *get_isrt_leg(struct intel_super *super, int leg)
+{
+	struct intel_dev *dv;
+
+	for (dv = super->devlist; dv; dv = dv->next)
+		if (!is_isrt_leg(dv))
+			continue;
+		else if (--leg == 0)
+			return dv;
+	return NULL;
+}
+
+static struct imsm_dev *get_imsm_dev(struct intel_super *super, __u8 index)
+{
+	struct intel_dev *dv = get_intel_dev(super, index);
+
+	return dv ? dv->dev : NULL;
 }
 
 /*
@@ -1123,20 +1163,115 @@ static int is_gen_migration(struct imsm_dev *dev);
 static __u64 blocks_per_migr_unit(struct intel_super *super,
 				  struct imsm_dev *dev);
 
-static void print_imsm_dev(struct intel_super *super,
-			   struct imsm_dev *dev,
-			   char *uuid,
-			   int disk_idx)
+/* generate the <cache> + <cache_target> (in that order) UUID */
+static int cache_volume_uuid(struct intel_super *super, struct intel_dev *dv, int uuid[4])
+{
+	char buf[20];
+	struct sha1_ctx ctx;
+	struct imsm_dev *dev = dv->dev;
+
+	if (!is_isrt_leg(dv))
+		return 1;
+
+	sha1_init_ctx(&ctx);
+	sha1_process_bytes(super->anchor->sig, MPB_SIG_LEN, &ctx);
+	if (dv->nvc) {
+		struct nv_cache_vol_config_md *cfg = &dv->nvc->hdr.vol_config_md[0];
+
+		/* self id + cache target id */
+		sha1_process_bytes(&super->anchor->orig_family_num, sizeof(__u32), &ctx);
+		sha1_process_bytes(&dev->dev_id, sizeof(dv->dev->dev_id), &ctx);
+		sha1_process_bytes(&cfg->acc_vol_orig_family_num, sizeof(__u32), &ctx);
+		sha1_process_bytes(&cfg->acc_vol_dev_id, sizeof(cfg->acc_vol_dev_id), &ctx);
+	} else if (nvc_enabled(dev->nv_cache_mode)) {
+		/* cache id + self id */
+		sha1_process_bytes(&dev->nvc_orig_family_num, sizeof(__u32), &ctx);
+		sha1_process_bytes(&dev->nvc_dev_id, sizeof(dev->nvc_dev_id), &ctx);
+		sha1_process_bytes(&super->anchor->orig_family_num, sizeof(__u32), &ctx);
+		sha1_process_bytes(&dev->dev_id, sizeof(dev->dev_id), &ctx);
+	}
+	sha1_finish_ctx(&ctx, buf);
+	memcpy(uuid, buf, 4*4);
+	return 0;
+}
+
+static void cache_target_uuid(struct intel_super *super, struct intel_dev *dv, int uuid[4])
+{
+	char buf[20];
+	struct sha1_ctx ctx;
+	struct nv_cache_vol_config_md *cfg = &dv->nvc->hdr.vol_config_md[0];
+
+	sha1_init_ctx(&ctx);
+	sha1_process_bytes(super->anchor->sig, MPB_SIG_LEN, &ctx);
+	sha1_process_bytes(&cfg->acc_vol_orig_family_num, sizeof(__u32), &ctx);
+	sha1_process_bytes(&cfg->acc_vol_dev_id, sizeof(cfg->acc_vol_dev_id), &ctx);
+	sha1_finish_ctx(&ctx, buf);
+	memcpy(uuid, buf, 4*4);
+}
+
+static void cache_uuid(struct intel_super *super, struct imsm_dev *dev, int uuid[4])
+{
+	char buf[20];
+	struct sha1_ctx ctx;
+
+	sha1_init_ctx(&ctx);
+	sha1_process_bytes(super->anchor->sig, MPB_SIG_LEN, &ctx);
+	sha1_process_bytes(&dev->nvc_orig_family_num, sizeof(__u32), &ctx);
+	sha1_process_bytes(&dev->nvc_dev_id, sizeof(dev->nvc_dev_id), &ctx);
+	sha1_finish_ctx(&ctx, buf);
+	memcpy(uuid, buf, 4*4);
+}
+
+static void examine_cache(struct intel_super *super, struct intel_dev *dv)
+{
+	int uuid[4];
+	char uuid_str[64];
+	char *cache_role = NULL;
+	struct imsm_dev *dev = dv->dev;
+
+	if (dv->nvc) {
+		cache_role = "cache";
+		cache_target_uuid(super, dv, uuid);
+	}
+	if (nvc_enabled(dev->nv_cache_mode)) {
+		if (cache_role)
+			cache_role = NULL; /* can't have it both ways */
+		else {
+			cache_role = "cache-target";
+			cache_uuid(super, dev, uuid);
+		}
+	}
+	__fname_from_uuid(uuid, 0, uuid_str, ':');
+
+	if (!cache_role)
+		return;
+
+	printf("          Magic : Intel (R) Smart Response Technology\n");
+	printf("     Cache role : %s\n", cache_role);
+	printf("     Cache peer : %s\n", uuid_str + 5);
+	cache_volume_uuid(super, dv, uuid);
+	__fname_from_uuid(uuid, 0, uuid_str, ':');
+	printf("   Cache volume : %s\n", uuid_str + 5);
+}
+
+static void print_imsm_dev(struct intel_super *super, struct intel_dev *dv,
+			   struct mdinfo *info, int disk_idx)
 {
 	__u64 sz;
+	__u32 ord;
 	int slot, i;
+	char uuid_str[64];
+	struct imsm_dev *dev = dv->dev;
 	struct imsm_map *map = get_imsm_map(dev, MAP_0);
 	struct imsm_map *map2 = get_imsm_map(dev, MAP_1);
-	__u32 ord;
+
+	if (super->load_cache)
+		examine_cache(super, dv);
 
 	printf("\n");
 	printf("[%.16s]:\n", dev->volume);
-	printf("           UUID : %s\n", uuid);
+	__fname_from_uuid(info->uuid, 0, uuid_str, ':');
+	printf("           UUID : %s\n", uuid_str + 5);
 	printf("     RAID Level : %d", get_imsm_raid_level(map));
 	if (map2)
 		printf(" <-- %d", get_imsm_raid_level(map2));
@@ -1225,6 +1360,11 @@ static void print_imsm_dev(struct intel_super *super,
 	}
 	printf("\n");
 	printf("    Dirty State : %s\n", dev->vol.dirty ? "dirty" : "clean");
+
+	if (!super->load_cache) {
+		printf("\n");
+		examine_cache(super, dv);
+	}
 }
 
 static void print_imsm_disk(struct imsm_disk *disk, int index, __u32 reserved)
@@ -1396,6 +1536,8 @@ static int imsm_check_attributes(__u32 attributes)
 
 #ifndef MDASSEMBLE
 static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *map);
+static void getinfo_super_imsm_cache(struct intel_super *super, struct intel_dev *dv,
+				     struct mdinfo *info, char *map);
 
 static void examine_super_imsm(struct supertype *st, char *homehost)
 {
@@ -1408,6 +1550,18 @@ static void examine_super_imsm(struct supertype *st, char *homehost)
 	__u32 sum;
 	__u32 reserved = imsm_reserved_sectors(super, super->disks);
 	struct dl *dl;
+
+	if (super->load_cache) {
+		struct intel_dev *dv = get_intel_dev(super, super->cache_dev);
+		struct mdinfo info;
+
+		super->load_cache = 0;
+		super->current_vol = super->cache_dev;
+		getinfo_super_imsm(st, &info, NULL);
+		super->load_cache = 1;
+		print_imsm_dev(super, dv, &info, super->disks->index);
+		return;
+	}
 
 	snprintf(str, MPB_SIG_LEN, "%s", mpb->sig);
 	printf("          Magic : %s\n", str);
@@ -1444,13 +1598,12 @@ static void examine_super_imsm(struct supertype *st, char *homehost)
 		       (unsigned long long) __le64_to_cpu(log->first_spare_lba));
 	}
 	for (i = 0; i < mpb->num_raid_devs; i++) {
+		struct intel_dev *dv = get_intel_dev(super, i);
 		struct mdinfo info;
-		struct imsm_dev *dev = __get_imsm_dev(mpb, i);
 
 		super->current_vol = i;
 		getinfo_super_imsm(st, &info, NULL);
-		fname_from_uuid(st, &info, nbuf, ':');
-		print_imsm_dev(super, dev, nbuf + 5, super->disks->index);
+		print_imsm_dev(super, dv, &info, super->disks->index);
 	}
 	for (i = 0; i < mpb->num_disks; i++) {
 		if (i == super->disks->index)
@@ -1467,7 +1620,6 @@ static void examine_super_imsm(struct supertype *st, char *homehost)
 
 static void brief_examine_super_imsm(struct supertype *st, int verbose)
 {
-	/* We just write a generic IMSM ARRAY entry */
 	struct mdinfo info;
 	char nbuf[64];
 	struct intel_super *super = st->sb;
@@ -1479,17 +1631,38 @@ static void brief_examine_super_imsm(struct supertype *st, int verbose)
 
 	getinfo_super_imsm(st, &info, NULL);
 	fname_from_uuid(st, &info, nbuf, ':');
-	printf("ARRAY metadata=imsm UUID=%s\n", nbuf + 5);
+	if (super->load_cache)
+		printf("ARRAY UUID=%s\n", nbuf + 5);
+	else
+		printf("ARRAY metadata=imsm UUID=%s\n", nbuf + 5);
+}
+
+static void brief_examine_cache_imsm(struct supertype *st, int cache_leg)
+{
+	char nbuf[64];
+	struct mdinfo info;
+	struct intel_super *super = st->sb;
+	struct intel_dev *dv = get_isrt_leg(super, cache_leg);
+
+	if (!dv)
+		return;
+
+	getinfo_super_imsm_cache(super, dv, &info, NULL);
+	fname_from_uuid(st, &info, nbuf, ':');
+	printf("ARRAY UUID=%s\n", nbuf + 5);
 }
 
 static void brief_examine_subarrays_imsm(struct supertype *st, int verbose)
 {
-	/* We just write a generic IMSM ARRAY entry */
-	struct mdinfo info;
+	int i;
 	char nbuf[64];
 	char nbuf1[64];
+	struct mdinfo info;
 	struct intel_super *super = st->sb;
-	int i;
+
+	/* don't re-report container metadata info */
+	if (super->load_cache)
+		return;
 
 	if (!super->anchor->num_raid_devs)
 		return;
@@ -1497,13 +1670,13 @@ static void brief_examine_subarrays_imsm(struct supertype *st, int verbose)
 	getinfo_super_imsm(st, &info, NULL);
 	fname_from_uuid(st, &info, nbuf, ':');
 	for (i = 0; i < super->anchor->num_raid_devs; i++) {
-		struct imsm_dev *dev = get_imsm_dev(super, i);
+		struct intel_dev *dv = get_intel_dev(super, i);
 
 		super->current_vol = i;
 		getinfo_super_imsm(st, &info, NULL);
 		fname_from_uuid(st, &info, nbuf1, ':');
 		printf("ARRAY /dev/md/%.16s container=%s member=%d UUID=%s\n",
-		       dev->volume, nbuf + 5, i, nbuf1 + 5);
+		       dv->dev->volume, nbuf + 5, i, nbuf1 + 5);
 	}
 }
 
@@ -2030,6 +2203,30 @@ static int match_home_imsm(struct supertype *st, char *homehost)
 	return -1;
 }
 
+static void volume_uuid_from_super(struct intel_super *super, struct sha1_ctx *ctx)
+{
+	struct imsm_dev *dev = NULL;
+
+	if (super->current_vol >= 0)
+		dev = get_imsm_dev(super, super->current_vol);
+
+	if (!dev)
+		return;
+
+	/* if the container is tracking creation events then dev_id is
+	 * valid and we can advertise an immutable uuid, otherwise use the
+	 * old volume-position/name method
+	 */
+	if (super->anchor->create_events) {
+		sha1_process_bytes(&dev->dev_id, sizeof(dev->dev_id), ctx);
+	} else {
+		__u32 vol = super->current_vol;
+
+		sha1_process_bytes(&vol, sizeof(vol), ctx);
+		sha1_process_bytes(dev->volume, MAX_RAID_SERIAL_LEN, ctx);
+	}
+}
+
 static void uuid_from_super_imsm(struct supertype *st, int uuid[4])
 {
 	/* The uuid returned here is used for:
@@ -2058,7 +2255,6 @@ static void uuid_from_super_imsm(struct supertype *st, int uuid[4])
 
 	char buf[20];
 	struct sha1_ctx ctx;
-	struct imsm_dev *dev = NULL;
 	__u32 family_num;
 
 	/* some mdadm versions failed to set ->orig_family_num, in which
@@ -2071,13 +2267,7 @@ static void uuid_from_super_imsm(struct supertype *st, int uuid[4])
 	sha1_init_ctx(&ctx);
 	sha1_process_bytes(super->anchor->sig, MPB_SIG_LEN, &ctx);
 	sha1_process_bytes(&family_num, sizeof(__u32), &ctx);
-	if (super->current_vol >= 0)
-		dev = get_imsm_dev(super, super->current_vol);
-	if (dev) {
-		__u32 vol = super->current_vol;
-		sha1_process_bytes(&vol, sizeof(vol), &ctx);
-		sha1_process_bytes(dev->volume, MAX_RAID_SERIAL_LEN, &ctx);
-	}
+	volume_uuid_from_super(super, &ctx);
 	sha1_finish_ctx(&ctx, buf);
 	memcpy(uuid, buf, 4*4);
 }
@@ -2834,14 +3024,93 @@ static struct imsm_disk *get_imsm_missing(struct intel_super *super, __u8 index)
 	return NULL;
 }
 
+static void getinfo_super_imsm_cache(struct intel_super *super, struct intel_dev *dv,
+				     struct mdinfo *info, char *dmap)
+{
+	__u16 nv_cache_mode;
+	int role_failed = 0, role;
+	struct imsm_dev *dev = dv->dev;
+	struct imsm_map *map = get_imsm_map(dev, MAP_X);
+
+	memset(info, 0, sizeof(*info));
+
+	role = dv->nvc ? ISRT_ROLE_CACHE : ISRT_ROLE_TARGET;
+	if (role == ISRT_ROLE_CACHE) {
+		struct nv_cache_vol_config_md *cfg = &dv->nvc->hdr.vol_config_md[0];
+
+		nv_cache_mode = cfg->nv_cache_mode;
+		info->events = 0;
+	} else {
+		nv_cache_mode = dev->nv_cache_mode;
+		info->events = 1; /* make Assemble choose the cache target */
+	}
+
+	if (map->map_state == IMSM_T_STATE_FAILED ||
+	    nv_cache_mode == NV_CACHE_MODE_IS_FAILING ||
+	    nv_cache_mode == NV_CACHE_MODE_HAS_FAILED)
+		role_failed = 1;
+
+	info->array.raid_disks    = 2;
+	info->array.level         = LEVEL_ISRT;
+	info->array.layout        = 0;
+	info->array.md_minor      = -1;
+	info->array.ctime         = 0;
+	info->array.utime         = 0;
+	info->array.chunk_size    = 0;
+
+	info->disk.major = 0;
+	info->disk.minor = 0;
+	info->disk.raid_disk = role;
+	info->reshape_active = 0;
+	info->array.major_version = -1;
+	info->array.minor_version = -2;
+	strcpy(info->text_version, "isrt");
+	info->safe_mode_delay = 0;
+	info->disk.number = role;
+	info->name[0] = 0;
+	info->recovery_start = MaxSector;
+	info->data_offset = 0;
+	info->custom_array_size = __le32_to_cpu(dev->size_high);
+	info->custom_array_size <<= 32;
+	info->custom_array_size |= __le32_to_cpu(dev->size_low);
+	info->component_size = info->custom_array_size;
+
+	if (role_failed)
+		info->disk.state = (1 << MD_DISK_FAULTY);
+	else
+		info->disk.state = (1 << MD_DISK_ACTIVE) | (1 << MD_DISK_SYNC);
+	cache_volume_uuid(super, dv, info->uuid);
+
+	if (dmap) {
+		/* we can only report self-state */
+		dmap[!role] = 1;
+		dmap[role] = !role_failed;
+	}
+}
+
+
 static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *map)
 {
-	struct intel_super *super = st->sb;
-	struct imsm_disk *disk;
-	int map_disks = info->array.raid_disks;
-	int max_enough = -1;
 	int i;
+	struct imsm_disk *disk;
 	struct imsm_super *mpb;
+	struct intel_super *super = st->sb;
+	int max_enough = -1, cache_legs = 0;
+	int map_disks = info->array.raid_disks;
+
+	if (super->load_cache || st->cache_leg) {
+		struct intel_dev *dv;
+
+		if (st->cache_leg) {
+			dv = get_isrt_leg(super, st->cache_leg);
+			if (!dv)
+				return;
+		} else
+			dv = get_intel_dev(super, super->cache_dev);
+
+		getinfo_super_imsm_cache(super, dv, info, map);
+		return;
+	}
 
 	if (super->current_vol >= 0) {
 		getinfo_super_imsm_volume(st, info, map);
@@ -2878,7 +3147,8 @@ static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *
 	mpb = super->anchor;
 
 	for (i = 0; i < mpb->num_raid_devs; i++) {
-		struct imsm_dev *dev = get_imsm_dev(super, i);
+		struct intel_dev *dv = get_intel_dev(super, i);
+		struct imsm_dev *dev = dv->dev;
 		int failed, enough, j, missing = 0;
 		struct imsm_map *map;
 		__u8 state;
@@ -2886,6 +3156,8 @@ static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *
 		failed = imsm_count_failed(super, dev, MAP_0);
 		state = imsm_check_degraded(super, dev, failed, MAP_0);
 		map = get_imsm_map(dev, MAP_0);
+		if (is_isrt_leg(dv))
+			cache_legs++;
 
 		/* any newly missing disks?
 		 * (catches single-degraded vs double-degraded)
@@ -2926,6 +3198,7 @@ static void getinfo_super_imsm(struct supertype *st, struct mdinfo *info, char *
 	}
 	dprintf("enough: %d\n", max_enough);
 	info->container_enough = max_enough;
+	info->cache_legs = cache_legs;
 
 	if (super->disks) {
 		__u32 reserved = imsm_reserved_sectors(super, super->disks);
@@ -3096,6 +3369,7 @@ static void free_devlist(struct intel_super *super)
 
 	while (super->devlist) {
 		dv = super->devlist->next;
+		free(super->devlist->nvc);
 		free(super->devlist->dev);
 		free(super->devlist);
 		super->devlist = dv;
@@ -3142,6 +3416,27 @@ static int compare_super_imsm(struct supertype *st, struct supertype *tst)
 				first->hba->pci_id, sec->hba->pci_id);
 			return 3;
 		}
+	}
+
+	/* cache configuration metadata lives on member arrays, as long
+	 * as they mutually agree on the volume-uuid then consider them a match
+	 * XXX: sufficient? we do have the failure checks in
+	 * getinfo_super_cache() to mitigate
+	 */
+	if (first->load_cache != sec->load_cache)
+		return 3;
+	else if (first->load_cache) {
+		struct intel_dev *first_dv, *sec_dv;
+		int first_uuid[4], sec_uuid[4];
+
+		first_dv = get_intel_dev(first, first->cache_dev);
+		sec_dv = get_intel_dev(sec, sec->cache_dev);
+		cache_volume_uuid(first, first_dv, first_uuid);
+		cache_volume_uuid(sec, sec_dv, sec_uuid);
+		if (memcmp(first_uuid, sec_uuid, sizeof(first_uuid)))
+			return 3;
+		else
+			return 0;
 	}
 
 	/* if an anchor does not have num_raid_devs set then it is a free
@@ -3482,9 +3777,34 @@ static void end_migration(struct imsm_dev *dev, struct intel_super *super,
 }
 #endif
 
-static int parse_raid_devices(struct intel_super *super)
+static int load_cache(int fd, struct intel_dev *dv)
 {
-	int i;
+	struct imsm_dev *dev = dv->dev;
+	struct imsm_map *map = get_imsm_map(dev, MAP_X);
+	off_t offset = pba_of_lba0(map) << 9;
+	ssize_t size = (sizeof(*dv->nvc) + 511) & ~511;
+	int ret;
+
+	if (posix_memalign((void**) &dv->nvc, 512, size) != 0) {
+		pr_err("Failed to allocate cache anchor buffer"
+				" for %.16s\n", dev->volume);
+		return 1;
+	}
+
+	ret = pread(fd, dv->nvc, size, offset);
+	if (ret != size) {
+		pr_err("Failed to read cache metadata for %.16s: %s\n",
+			dev->volume, strerror(errno));
+		free(dv->nvc);
+		dv->nvc = NULL;
+	}
+
+	return ret != size;
+}
+
+static int load_raid_devices(int fd, struct intel_super *super)
+{
+	int i, err;
 	struct imsm_dev *dev_new;
 	size_t len, len_migr;
 	size_t max_len = 0;
@@ -3511,6 +3831,16 @@ static int parse_raid_devices(struct intel_super *super)
 		dv->index = i;
 		dv->next = super->devlist;
 		super->devlist = dv;
+
+		/* volumes that serve as caches have metadata at offset-0 from
+		 * the start of the volume
+		 */
+		if (dv->dev->status & DEV_NVC_VOLUME) {
+			err = load_cache(fd, dv);
+			if (err)
+				return err;
+		} else
+			dv->nvc = NULL;
 	}
 
 	/* ensure that super->buf is large enough when all raid devices
@@ -3732,8 +4062,7 @@ static void clear_hi(struct intel_super *super)
 	}
 }
 
-static int
-load_and_parse_mpb(int fd, struct intel_super *super, char *devname, int keep_fd)
+static int load_mpb(int fd, struct intel_super *super, char *devname, int keep_fd)
 {
 	int err;
 
@@ -3743,7 +4072,10 @@ load_and_parse_mpb(int fd, struct intel_super *super, char *devname, int keep_fd
 	err = load_imsm_disk(fd, super, devname, keep_fd);
 	if (err)
 		return err;
-	err = parse_raid_devices(super);
+	err = load_raid_devices(fd, super);
+	if (err)
+		return err;
+
 	clear_hi(super);
 	return err;
 }
@@ -4394,13 +4726,13 @@ static int get_super_block(struct intel_super **super_list, char *devnm, char *d
 	}
 
 	find_intel_hba_capability(dfd, s, devname);
-	err = load_and_parse_mpb(dfd, s, NULL, keep_fd);
+	err = load_mpb(dfd, s, NULL, keep_fd);
 
 	/* retry the load if we might have raced against mdmon */
 	if (err == 3 && devnm && mdmon_running(devnm))
 		for (retry = 0; retry < 3; retry++) {
 			usleep(3000);
-			err = load_and_parse_mpb(dfd, s, NULL, keep_fd);
+			err = load_mpb(dfd, s, NULL, keep_fd);
 			if (err != 3)
 				break;
 		}
@@ -4457,6 +4789,52 @@ static int load_container_imsm(struct supertype *st, int fd, char *devname)
 {
 	return load_super_imsm_all(st, fd, &st->sb, devname, NULL, 1);
 }
+
+static int load_super_cache(struct supertype *st, int fd, char *devname)
+{
+	struct mdinfo *sra = sysfs_read(fd, 0, GET_VERSION);
+	char *subarray, *devnm, *ep;
+	int cfd, cache_dev, err = 1;
+	struct intel_super *super;
+	struct intel_dev *dv;
+
+	if (sra && sra->array.major_version == -1 &&
+	    is_subarray(sra->text_version))
+		/* pass */;
+	else
+		goto out;
+
+	/* modify sra->text_version in place */
+	ep = strchr(sra->text_version+1, '/');
+	*ep = '\0';
+	devnm = sra->text_version+1;
+	subarray = ep+1;
+
+	cfd = open_dev(devnm);
+	if (cfd < 0)
+		goto out;
+
+	err = load_container_imsm(st, cfd, devname);
+	close(cfd);
+	if (err)
+		goto out;
+
+	super = st->sb;
+	cache_dev = strtoul(subarray, &ep, 10);
+	/* validate this volume is a cache or cache-target */
+	if (*ep != '\0' || !(dv = get_intel_dev(super, cache_dev))
+	    || !is_isrt_leg(dv)) {
+		free_super_imsm(st);
+		err = 2;
+		goto out;
+	}
+
+	super->load_cache = 1;
+	super->cache_dev = cache_dev;
+ out:
+	sysfs_free(sra);
+	return err;
+}
 #endif
 
 static int load_super_imsm(struct supertype *st, int fd, char *devname)
@@ -4471,6 +4849,15 @@ static int load_super_imsm(struct supertype *st, int fd, char *devname)
 
 	free_super_imsm(st);
 
+#ifndef MDASSEMBLE
+	/* check if this is a component leg of a cache array and load
+	 * the cache metadata from the parent container
+	 */
+	rv = load_super_cache(st, fd, devname);
+	if (rv == 0)
+		return rv;
+#endif
+
 	super = alloc_super();
 	/* Load hba and capabilities if they exist.
 	 * But do not preclude loading metadata in case capabilities or hba are
@@ -4484,7 +4871,7 @@ static int load_super_imsm(struct supertype *st, int fd, char *devname)
 		free_imsm(super);
 		return 2;
 	}
-	rv = load_and_parse_mpb(fd, super, devname, 0);
+	rv = load_mpb(fd, super, devname, 0);
 
 	/* retry the load if we might have raced against mdmon */
 	if (rv == 3) {
@@ -4493,7 +4880,7 @@ static int load_super_imsm(struct supertype *st, int fd, char *devname)
 		if (mdstat && mdmon_running(mdstat->devnm) && getpid() != mdmon_pid(mdstat->devnm)) {
 			for (retry = 0; retry < 3; retry++) {
 				usleep(3000);
-				rv = load_and_parse_mpb(fd, super, devname, 0);
+				rv = load_mpb(fd, super, devname, 0);
 				if (rv != 3)
 					break;
 			}
@@ -4619,6 +5006,39 @@ static int check_name(struct intel_super *super, char *name, int quiet)
 	return !reason;
 }
 
+static void new_dev_id(struct intel_super *super, struct imsm_dev *new_dev)
+{
+	struct imsm_super *mpb = super->anchor;
+	__u16 create_events, i;
+
+	/* only turn on create_events tracking for newly born
+	 * containers, lest we change the uuid of live volumes (see
+	 * volume_uuid_from_super())
+	 */
+	create_events = __le16_to_cpu(mpb->create_events);
+	if (super->current_vol > 0 && !create_events)
+		return;
+
+	/* catch the case of create_events wrapping to an existing id in
+	 * the mpb
+	 */
+	do {
+		create_events++;
+		/* wrap to 1, because zero means no dev_id support */
+		if (create_events == 0)
+			create_events = 1;
+		for (i = 0; i < mpb->num_raid_devs; i++) {
+			struct imsm_dev *dev = __get_imsm_dev(mpb, i);
+
+			if (dev->dev_id == __cpu_to_le16(create_events))
+				break;
+		}
+	} while (i < mpb->num_raid_devs);
+
+	new_dev->dev_id = __cpu_to_le16(create_events);
+	mpb->create_events = __cpu_to_le16(create_events);
+}
+
 static int init_super_imsm_volume(struct supertype *st, mdu_array_info_t *info,
 				  unsigned long long size, char *name,
 				  char *homehost, int *uuid,
@@ -4710,6 +5130,7 @@ static int init_super_imsm_volume(struct supertype *st, mdu_array_info_t *info,
 		return 0;
 	dv = xmalloc(sizeof(*dv));
 	dev = xcalloc(1, sizeof(*dev) + sizeof(__u32) * (info->raid_disks - 1));
+	new_dev_id(super, dev);
 	strncpy((char *) dev->volume, name, MAX_RAID_SERIAL_LEN);
 	array_blocks = calc_array_size(info->level, info->raid_disks,
 					       info->layout, info->chunk_size,
@@ -10612,6 +11033,7 @@ struct superswitch super_imsm = {
 	.examine_super	= examine_super_imsm,
 	.brief_examine_super = brief_examine_super_imsm,
 	.brief_examine_subarrays = brief_examine_subarrays_imsm,
+	.brief_examine_cache = brief_examine_cache_imsm,
 	.export_examine_super = export_examine_super_imsm,
 	.detail_super	= detail_super_imsm,
 	.brief_detail_super = brief_detail_super_imsm,
